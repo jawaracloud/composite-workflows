@@ -1,0 +1,126 @@
+# deploy-docker-compose/action.yml
+name: 'Deploy Docker-Compose Service'
+description: 'SSH-deploy a service via docker-compose on any runner (self-hosted or GitHub-hosted)'
+author: 'Jawara Cloud'
+
+inputs:
+  img_name:
+    description: 'Docker image name (without tag or registry)'
+    required: true
+  service_name:
+    description: 'Service name inside the docker-compose file'
+    required: true
+  compose_path:
+    description: 'Full path to docker-compose.yaml on the target server'
+    required: true
+  ssh_key:
+    description: 'SSH private key'
+    required: true
+  ssh_host:
+    description: 'Target SSH host'
+    required: true
+  ssh_username:
+    description: 'SSH username'
+    required: true
+  ecr_registry:
+    description: 'ECR registry (or other Docker registry URL)'
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    # ------------------------------------------------------------------
+    # 1. Ensure docker compose (v2 plugin or standalone) exists
+    # ------------------------------------------------------------------
+    - name: Set up Docker Buildx & Compose
+      uses: docker/setup-buildx-action@v3     # installs/updates compose v2 plugin
+      with:
+        install: true                         # puts `docker compose` in PATH
+
+    # ------------------------------------------------------------------
+    # 2. Ensure yq exists
+    # ------------------------------------------------------------------
+    - name: Install yq (if missing)
+      shell: bash
+      run: |
+        if ! command -v yq >/dev/null 2>&1; then
+          echo "::group::Installing yq"
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+          echo "::endgroup::"
+        else
+          echo "yq already installed: $(yq --version)"
+        fi
+
+    # ------------------------------------------------------------------
+    # 3. Checkout (needed only to read VERSIONS file)
+    # ------------------------------------------------------------------
+    - name: Checkout latest commit
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Pull latest commit
+      shell: bash
+      run: git pull origin "${GITHUB_REF#refs/heads/}"
+
+    # ------------------------------------------------------------------
+    # 4. Determine version & image tag
+    # ------------------------------------------------------------------
+    - name: Determine version
+      id: determine_version
+      shell: bash
+      run: |
+        if [ -f "./VERSIONS" ]; then
+          VERSION=$(cat ./VERSIONS)
+        else
+          echo "::error::VERSIONS file not found!"
+          exit 1
+        fi
+        echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+        echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+    - name: Set Docker image tag
+      id: set_image_tag
+      shell: bash
+      run: |
+        IMAGE_TAG="${{ inputs.ecr_registry }}/${{ inputs.img_name }}:${{ env.VERSION }}"
+        echo "IMAGE_TAG=${IMAGE_TAG}" >> "$GITHUB_ENV"
+        echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+        echo "Docker Image Tag: $IMAGE_TAG"
+
+    # ------------------------------------------------------------------
+    # 5. Deploy via SSH
+    # ------------------------------------------------------------------
+    - name: Deploy to target server
+      uses: appleboy/ssh-action@v1.2.1
+      with:
+        host: ${{ inputs.ssh_host }}
+        username: ${{ inputs.ssh_username }}
+        key: ${{ inputs.ssh_key }}
+        script: |
+          set -e
+          COMPOSE_PATH="${{ inputs.compose_path }}"
+          SERVICE="${{ inputs.service_name }}"
+          IMAGE="${{ env.IMAGE_TAG }}"
+
+          echo "Using compose file: $COMPOSE_PATH"
+          echo "Target service: $SERVICE"
+          echo "New image: $IMAGE"
+
+          cd "$(dirname "$COMPOSE_PATH")"
+
+          echo "Fetching current image..."
+          PREV_IMAGE=$(yq eval '.services["'"$SERVICE"'"].image' "$COMPOSE_PATH")
+          echo "Previous image for service '$SERVICE': $PREV_IMAGE"
+
+          echo "Updating service image..."
+          yq eval -i '.services["'"$SERVICE"'"].image = "'"$IMAGE"'"' "$COMPOSE_PATH"
+
+          echo "Pulling new image..."
+          docker compose -f "$COMPOSE_PATH" pull "$SERVICE"
+
+          echo "Restarting service..."
+          docker compose -f "$COMPOSE_PATH" up -d --remove-orphans "$SERVICE"
+
+          echo "Deployment complete."
