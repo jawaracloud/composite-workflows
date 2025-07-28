@@ -1,0 +1,136 @@
+# build-push-ecr/action.yml
+name: "Build & Push Multi-Arch ECR Image (Buildah + Mirrored Cache)"
+description: |
+  Build multi-arch image with Buildah, push to ECR,
+  and keep a mirrored cache image for layer reuse.
+author: "Jawara Cloud"
+
+inputs:
+  img_name:
+    description: "Image repo name"
+    required: true
+  build_args:
+    description: "Docker build args (space-separated KEY=value pairs)"
+    required: false
+  build_locations:
+    description: "Docker build context directory"
+    required: false
+  use_env_file:
+    description: "Download .env artifact if true"
+    default: "false"
+  ecr_registry:
+    description: "AWS ECR Registry URL"
+    required: true
+  aws_region:
+    description: "AWS Region"
+    required: true
+  aws_profile:
+    description: "AWS Profile"
+    required: true
+  cache_image_name:
+    description: "Name (without registry) of the cache image"
+    default: "cache"
+    required: false
+  cache_ttl:
+    description: "How long to trust cached layers (e.g. 24h)"
+    default: "24h"
+    required: false
+
+outputs:
+  image_tag:
+    description: "Full image:tag that was pushed"
+    value: ${{ steps.set_image_tag.outputs.image_tag }}
+  version:
+    description: "Version string read from VERSIONS file"
+    value: ${{ steps.determine_version.outputs.version }}
+
+runs:
+  using: "composite"
+  steps:
+    # ------------------------------------------------------------------
+    # 1. Checkout & optional .env download
+    # ------------------------------------------------------------------
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - shell: bash
+      run: git pull origin "${GITHUB_REF#refs/heads/}"
+
+    - uses: actions/download-artifact@v4
+      if: inputs.use_env_file == 'true'
+      with:
+        name: env-file
+      continue-on-error: true
+
+    # ------------------------------------------------------------------
+    # 2. AWS & Buildah setup
+    # ------------------------------------------------------------------
+    - uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-region: ${{ inputs.aws_region }}
+        role-to-assume: ${{ inputs.aws_profile }}
+
+    - name: Install Buildah
+      shell: bash
+      run: |
+        if ! command -v buildah >/dev/null 2>&1; then
+          sudo apt-get update -qq && sudo apt-get install -y buildah
+        fi
+
+    - name: Login to ECR (Buildah)
+      shell: bash
+      run: |
+        aws ecr get-login-password --region ${{ inputs.aws_region }} \
+        | buildah login --username AWS --password-stdin ${{ inputs.ecr_registry }}
+
+    # ------------------------------------------------------------------
+    # 3. Version & image tag
+    # ------------------------------------------------------------------
+    - name: Determine version
+      id: determine_version
+      shell: bash
+      run: |
+        if [ -f "./VERSIONS" ]; then
+          VERSION=$(cat ./VERSIONS)
+        else
+          echo "::error::VERSIONS file not found!"; exit 1
+        fi
+        echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+        echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+    - name: Set image tag
+      id: set_image_tag
+      shell: bash
+      run: |
+        IMAGE_TAG="${{ inputs.ecr_registry }}/${{ inputs.img_name }}:${{ env.VERSION }}"
+        CACHE_TAG="${{ inputs.ecr_registry }}/${{ inputs.cache_image_name }}:${{ env.VERSION }}"
+        echo "IMAGE_TAG=${IMAGE_TAG}" >> "$GITHUB_ENV"
+        echo "CACHE_TAG=${CACHE_TAG}"  >> "$GITHUB_ENV"
+        echo "image_tag=${IMAGE_TAG}"  >> "$GITHUB_OUTPUT"
+
+    # ------------------------------------------------------------------
+    # 4. Build & push multi-arch image with mirrored cache
+    # ------------------------------------------------------------------
+    - name: Build & Push Multi-Arch Image with Cache
+      shell: bash
+      run: |
+        CONTEXT="${{ inputs.build_locations || '.' }}"
+
+        BUILD_ARGS=""
+        if [ -n "${{ inputs.build_args }}" ]; then
+          for ARG in ${{ inputs.build_args }}; do
+            BUILD_ARGS="$BUILD_ARGS --build-arg $ARG"
+          done
+        fi
+
+        buildah build \
+          --manifest "${{ env.IMAGE_TAG }}" \
+          --platform linux/amd64,linux/arm64 \
+          --layers \
+          --cache-from "${{ env.CACHE_TAG }}" \
+          --cache-to   "${{ env.CACHE_TAG }}" \
+          --cache-ttl  "${{ inputs.cache_ttl }}" \
+          $BUILD_ARGS \
+          "$CONTEXT"
+
+        buildah manifest push --all "${{ env.IMAGE_TAG }}" "docker://${{ env.IMAGE_TAG }}"
